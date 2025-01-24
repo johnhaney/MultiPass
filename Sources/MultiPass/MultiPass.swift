@@ -304,11 +304,13 @@ extension MultiPass {
         let header = try decoder.decode(Header.self, from: headerData)
         let payload = data.suffix(header.size)
         for (messageType, MessageType) in expectedTypes {
-            do {
-                let message = try decoder.decode(MessageType.self, from: payload)
-                return (messageType, message, header.from)
-            } catch {
-                continue
+            if header.messageType == MessageType.multiPassMessageType {
+                do {
+                    let message = try decoder.decode(MessageType.self, from: payload)
+                    return (messageType, message, header.from)
+                } catch {
+                    continue
+                }
             }
         }
         throw Error.unrecognized
