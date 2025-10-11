@@ -13,8 +13,8 @@ fileprivate let logger = Logger(subsystem: "com.appsfromouterspace.MultiPass", c
 
 class MultipeerConnector: MultiConnector, ObservableObject {
     let id: UUID = UUID()
-    var mapping: [MCPeerID: MultiPass.Participant] = [:]
-    var router: [MultiPass.Participant : MCPeerID] = [:]
+    @MainActor var mapping: [MCPeerID: MultiPass.Participant] = [:]
+    @MainActor var router: [MultiPass.Participant : MCPeerID] = [:]
     
     private let myPeerID: MCPeerID
     private let delegate: Delegate
@@ -29,11 +29,12 @@ class MultipeerConnector: MultiConnector, ObservableObject {
         myPeerID = MCPeerID(displayName: peerID.uuidString)
         advertiser = MCNearbyServiceAdvertiser(peer: myPeerID, discoveryInfo: nil, serviceType: serviceName)
         browser = MCNearbyServiceBrowser(peer: myPeerID, serviceType: serviceName)
-        session = MCSession(peer: myPeerID)
+        session = MCSession(peer: myPeerID, securityIdentity: nil, encryptionPreference: .optional)
         delegate = Delegate(localID: peerID)
         delegate.manager = self
         delegate.session = session
         session.delegate = delegate
+        print("JMH: init \(id)")
     }
     
     deinit {
@@ -45,7 +46,7 @@ class MultipeerConnector: MultiConnector, ObservableObject {
 }
 
 extension MultipeerConnector {
-    func send(data: Data, reliable: Bool = true) {
+    @MainActor func send(data: Data, reliable: Bool = true) {
         guard !delegate.peerState.isEmpty else {
 //            logger.debug("Multipeer no state, not sending \(data.count) byte message")
             return
@@ -74,7 +75,7 @@ extension MultipeerConnector {
         }
     }
     
-    func receive(data: Data, from: MCPeerID) throws {
+    @MainActor func receive(data: Data, from: MCPeerID) throws {
         let onParticipant = { participant in
             self.router[participant] = from
             self.mapping[from] = participant
@@ -88,11 +89,17 @@ extension MultipeerConnector {
 extension MultipeerConnector {
     fileprivate class Delegate: NSObject {
         fileprivate let logger = Logger(subsystem: "com.appsfromouterspace.MultiPass", category: "Multipeer")
-        var peerState: [MCPeerID: MCSessionState] = [:]
+        @MainActor var peerState: [MCPeerID: MCSessionState] = [:]
+        @MainActor var peerSetupState: [MCPeerID: SetupState] = [:]
         var manager: MultipeerConnector!
         var session: MCSession!
         var localID: UUID
-        func handle(_ data: Data, from: MCPeerID) {
+        enum SetupState {
+            case accepted
+            case invited
+            case connected
+        }
+        @MainActor func handle(_ data: Data, from: MCPeerID) {
             do {
                 try manager.receive(data: data, from: from)
             } catch {
@@ -134,10 +141,12 @@ extension MultipeerConnector {
         advertiser.delegate = nil
     }
     
-    func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+    @MainActor func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
         switch state {
         case .notConnected:
+            delegate.peerState.removeValue(forKey: peerID)
             logger.debug("peer did change state - disconnected")
+            delegate.peerSetupState.removeValue(forKey: peerID)
             if let participant = self.mapping[peerID] {
                 multipass.remove(remote: participant)
                 self.mapping.removeValue(forKey: peerID)
@@ -147,6 +156,7 @@ extension MultipeerConnector {
             logger.debug("peer did change state - connecting")
         case .connected:
             logger.debug("peer did change state - connected")
+            delegate.peerSetupState[peerID] = .connected
             do {
                 let data = try multipass.helloMessage(again: mapping.keys.contains(peerID))
                 try session.send(data, toPeers: [peerID], with: .reliable)
@@ -160,15 +170,79 @@ extension MultipeerConnector {
     }
 }
 
+extension MultipeerConnector.Delegate {
+    @MainActor func handleFound(peerID: MCPeerID) -> Bool {
+        logger.debug("Found peer \(peerID)")
+        switch peerSetupState[peerID] {
+        case .accepted:
+            logger.debug("Found peer, peerSetupState already accepted")
+            return false
+        case .invited:
+            logger.debug("Found peer, peerSetupState already invited")
+            return false
+        case .connected:
+            logger.debug("Found peer, peerSetupState already connected")
+            return false
+        case .none:
+            logger.debug("Found new peer, no peerSetupState")
+            break
+        }
+        switch peerState[peerID] {
+        case .connected:
+            logger.debug("Found peer, peerState already connected")
+            peerSetupState[peerID] = .connected
+            return false
+        case .connecting:
+            logger.debug("Found peer, peerState connecting")
+            break
+        case .notConnected, .none:
+            logger.debug("Found peer, peerState not connected")
+            break
+        }
+        peerSetupState[peerID] = .invited
+        logger.debug("Found peer, inviting... \(self.localID) \(peerID.displayName)")
+        logger.debug("Found peer & invited")
+        return true
+    }
+    
+    @MainActor func handleInvite(from peerID: MCPeerID) -> Bool {
+        switch peerSetupState[peerID] {
+        case .accepted:
+            logger.debug("invited, peerSetupState already accepted")
+            return false
+        case .invited:
+            logger.debug("invited, peerSetupState already invited")
+            return false
+        case .connected:
+            logger.debug("invited, peerSetupState already connected")
+            return false
+        case .none:
+            break
+        }
+        switch peerState[peerID] {
+        case .connected:
+            logger.debug("invited, peerState already connected")
+            peerSetupState[peerID] = .connected
+            return false
+        case .connecting:
+            break
+        case .notConnected, .none:
+            break
+        }
+        peerSetupState[peerID] = .accepted
+        logger.debug("invited, accepting...")
+        return true
+    }
+}
+
 extension MultipeerConnector.Delegate: MCNearbyServiceBrowserDelegate {
     func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String : String]?) {
-        logger.debug("Found peer \(peerID)")
-//        if peerID.displayName < localID.uuidString {
-            guard peerState[peerID] != .connected else { return }
-            logger.debug("Found peer, inviting...")
-            peerState[peerID] = .connecting
-            browser.invitePeer(peerID, to: session, withContext: nil, timeout: 10.0)
-//        }
+        Task {
+            let invite = await handleFound(peerID: peerID)
+            if invite {
+                browser.invitePeer(peerID, to: session, withContext: nil, timeout: 10.0)
+            }
+        }
     }
     
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
@@ -182,8 +256,14 @@ extension MultipeerConnector.Delegate: MCNearbyServiceBrowserDelegate {
 
 extension MultipeerConnector.Delegate: MCNearbyServiceAdvertiserDelegate {
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        logger.debug("invited")
-        invitationHandler(true, session)
+        Task {
+            let accept = await handleInvite(from: peerID)
+            if accept {
+                invitationHandler(true, session)
+            } else {
+                invitationHandler(false, nil)
+            }
+        }
     }
     
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: any Error) {
@@ -193,24 +273,35 @@ extension MultipeerConnector.Delegate: MCNearbyServiceAdvertiserDelegate {
 
 extension MultipeerConnector.Delegate: MCSessionDelegate {
     func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+        Task {
+            await handle(session, peer: peerID, state: state)
+        }
+    }
+    
+    @MainActor func handle(_ session: MCSession, peer peerID: MCPeerID, state: MCSessionState) {
         peerState[peerID] = state
         self.manager.session(session, peer: peerID, didChange: state)
         switch state {
         case .notConnected:
             logger.debug("peer \(peerID) not connected")
 //            peerState.removeValue(forKey: peerID)
+            peerSetupState.removeValue(forKey: peerID)
         case .connecting:
             logger.debug("peer \(peerID) connecting...")
         case .connected:
             logger.debug("peer \(peerID) connected")
+            peerSetupState[peerID] = .connected
         @unknown default:
             logger.warning("peer \(peerID) UNKNOWN STATE \(state.rawValue)")
+            peerSetupState.removeValue(forKey: peerID)
         }
     }
     
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
         logger.debug("data \(data.count) from \(peerID)")
-        handle(data, from: peerID)
+        Task {
+            await handle(data, from: peerID)
+        }
     }
     
     func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {

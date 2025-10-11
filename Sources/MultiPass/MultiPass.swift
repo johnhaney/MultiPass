@@ -5,7 +5,7 @@ import Combine
 
 fileprivate let logger = Logger(subsystem: "com.appsfromouterspace.MultiPass", category: "Configuration")
 
-public class MultiPass: ObservableObject {
+public class MultiPass: ObservableObject, Sendable {
     public static var none: MultiPass { MultiPass() }
     
     let configuration: Configuration
