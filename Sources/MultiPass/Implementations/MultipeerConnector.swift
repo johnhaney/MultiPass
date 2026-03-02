@@ -199,10 +199,22 @@ extension MultipeerConnector.Delegate {
             logger.debug("Found peer, peerState not connected")
             break
         }
-        peerSetupState[peerID] = .invited
-        logger.debug("Found peer, inviting... \(self.localID) \(peerID.displayName)")
-        logger.debug("Found peer & invited")
-        return true
+        
+        // Use tie-breaking: only invite if our ID is "greater" to avoid both devices inviting each other
+        guard let remotePeerUUID = UUID(uuidString: peerID.displayName) else {
+            logger.debug("Found peer with invalid UUID displayName, inviting anyway")
+            peerSetupState[peerID] = .invited
+            return true
+        }
+        
+        if localID.uuidString > remotePeerUUID.uuidString {
+            peerSetupState[peerID] = .invited
+            logger.debug("Found peer, inviting... \(self.localID) > \(peerID.displayName)")
+            return true
+        } else {
+            logger.debug("Found peer, waiting for invitation... \(self.localID) <= \(peerID.displayName)")
+            return false
+        }
     }
     
     @MainActor func handleInvite(from peerID: MCPeerID) -> Bool {
@@ -211,8 +223,11 @@ extension MultipeerConnector.Delegate {
             logger.debug("invited, peerSetupState already accepted")
             return false
         case .invited:
-            logger.debug("invited, peerSetupState already invited")
-            return false
+            // If we already invited them, but they're also inviting us, accept theirs instead
+            // This handles the race condition where both devices find each other simultaneously
+            logger.debug("invited, peerSetupState already invited - accepting to resolve race")
+            peerSetupState[peerID] = .accepted
+            return true
         case .connected:
             logger.debug("invited, peerSetupState already connected")
             return false
